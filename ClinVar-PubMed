@@ -1,0 +1,189 @@
+# ----------------------------
+# Imports and API Setup
+# ----------------------------
+import os
+import time
+import requests
+import pandas as pd
+from bs4 import BeautifulSoup
+from dotenv import load_dotenv
+from IPython.display import display, Markdown
+import ipywidgets as widgets
+import openai
+import json
+
+# ✅ Load API Key
+load_dotenv()
+api_key = os.getenv("OPENAI_API_KEY")
+if not api_key:
+    raise ValueError("❌ OPENAI_API_KEY not found in .env")
+client = openai.OpenAI(api_key=api_key)
+
+# ----------------------------
+# PubMed Abstract Fetcher
+# ----------------------------
+def fetch_pubmed_abstracts(gene):
+    query = f"{gene} AND (mutation OR missense OR nonsense OR frameshift OR deletion OR insertion)"
+    ids = requests.get(
+        "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi",
+        params={"db": "pubmed", "term": query, "retmax": 10, "retmode": "json"}
+    ).json()["esearchresult"]["idlist"]
+
+    xml = requests.get(
+        "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi",
+        params={"db": "pubmed", "id": ",".join(ids), "retmode": "xml"}
+    ).text
+    soup = BeautifulSoup(xml, "xml")
+
+    abstracts = []
+    for article in soup.find_all("PubmedArticle"):
+        title = article.Article.ArticleTitle.get_text() if article.Article.ArticleTitle else "No Title"
+        abstract = " ".join(a.get_text() for a in article.find_all("AbstractText")) or "No abstract available"
+        abstracts.append(f"**{title}**\n{abstract}")
+    return abstracts
+
+# ----------------------------
+# ClinVar Variant Fetcher (Only Pathogenic/Likely Pathogenic)
+# ----------------------------
+def fetch_clinvar_variants(gene):
+    print(f"🔄 Fetching ClinVar variants via esummary for gene: {gene}")
+
+    # Step 1: Search ClinVar (limit to 200 IDs)
+    search = requests.get(
+        "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi",
+        params={"db": "clinvar", "term": f"{gene}[gene]", "retmax": 200, "retmode": "json"}
+    )
+    ids = search.json()["esearchresult"]["idlist"]
+    print(f"✅ Found {len(ids)} ClinVar IDs")
+
+    if not ids:
+        return []
+
+    # Step 2: Fetch summaries
+    summary = requests.get(
+        "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esummary.fcgi",
+        params={"db": "clinvar", "id": ",".join(ids), "retmode": "json"}
+    ).json()
+
+    variants = []
+    for uid in ids:
+        doc = summary["result"].get(uid, {})
+        try:
+            hgvs = doc.get("title", "Unknown")
+            variation_set = doc.get("variation_set", [])
+            variant_type = variation_set[0].get("variant_type", "Unknown") if variation_set else "Unknown"
+            germ = doc.get("germline_classification", {})
+            significance = germ.get("description", "Unknown").strip()
+
+            # ✅ Only keep "Pathogenic" or "Likely pathogenic"
+            if significance.lower() not in {"pathogenic", "likely pathogenic"}:
+                continue
+
+            trait_set = germ.get("trait_set", [])
+            condition = trait_set[0].get("trait_name", "Unknown") if trait_set else "Unknown"
+
+            variants.append({
+                "HGVS": hgvs,
+                "Type": variant_type,
+                "Significance": significance,
+                "Condition": condition
+            })
+        except Exception as e:
+            print(f"⚠️ Skipped {uid} due to error: {e}")
+            continue
+
+    print(f"✅ Extracted {len(variants)} pathogenic/likely pathogenic ClinVar variants")
+    return variants
+
+# ----------------------------
+# GPT Summary Generator
+# ----------------------------
+def generate_summary(gene, abstracts, variants):
+    if not abstracts:
+        print(f"⚠️ No PubMed abstracts found for {gene}")
+    if not variants:
+        print(f"⚠️ No ClinVar variants found for {gene}")
+
+    if not abstracts and not variants:
+        return f"❗ No relevant data found for {gene} in PubMed or ClinVar."
+
+    table_header = "| HGVS | Type | Significance | Condition |\n|------|------|--------------|-----------|"
+    table_rows = "\n".join(
+        f"| `{v.get('HGVS', 'Unknown')}` | `{v.get('Type', 'Unknown')}` | `{v.get('Significance', 'Unknown')}` | `{v.get('Condition', 'Unknown')}` |"
+        for v in variants
+    )
+    table = f"{table_header}\n{table_rows}"
+    abstract_text = "\n\n".join(abstracts) if abstracts else "*No PubMed abstracts found.*"
+
+    prompt = (
+        f"You are a biomedical assistant.\n\n"
+        f"Below are:\n"
+        f"1. PubMed abstracts for the gene {gene} related to mutations\n"
+        f"2. Variant entries from ClinVar\n\n"
+        f"Summarise the mutation patterns and clinical significance in Markdown.\n\n"
+        f"PubMed Abstracts:\n\n{abstract_text}\n\n"
+        f"ClinVar Variants:\n\n{table}"
+    )
+
+    try:
+        response = client.chat.completions.create(
+            model="gpt-4o",
+            messages=[
+                {"role": "system", "content": "You are a biomedical assistant."},
+                {"role": "user", "content": prompt}
+            ]
+        )
+        return response.choices[0].message.content
+    except Exception as e:
+        return f"❌ GPT summarisation failed: {e}"
+
+# ----------------------------
+# Pipeline Controller
+# ----------------------------
+def run_pipeline(gene):
+    try:
+        print(f"🔍 Searching PubMed and ClinVar for gene: {gene}")
+        abstracts = fetch_pubmed_abstracts(gene)
+        variants = fetch_clinvar_variants(gene)
+
+        if variants:
+            table_header = "| HGVS | Type | Significance | Condition |\n|------|------|--------------|-----------|"
+            table_rows = "\n".join(
+                f"| `{v.get('HGVS', 'Unknown')}` | `{v.get('Type', 'Unknown')}` | `{v.get('Significance', 'Unknown')}` | `{v.get('Condition', 'Unknown')}` |"
+                for v in variants
+            )
+            markdown_table = f"{table_header}\n{table_rows}"
+            display(Markdown("### 🧬 ClinVar Variant Table\n" + markdown_table))
+        else:
+            print("⚠️ No variants to show in table format.")
+
+        summary = generate_summary(gene, abstracts, variants)
+        display(Markdown(summary))
+
+        pd.DataFrame(variants).to_csv(f"{gene}_clinvar.csv", index=False)
+        with open(f"{gene}_summary.md", "w", encoding="utf-8") as f:
+            f.write(summary)
+
+        print(f"✅ Saved: {gene}_clinvar.csv, {gene}_summary.md")
+    except Exception as e:
+        print(f"❌ Error: {e}")
+
+# ----------------------------
+# Jupyter UI
+# ----------------------------
+gene_box = widgets.Text(value='TP53', placeholder='Enter gene name', description='Gene:')
+run_btn = widgets.Button(description="Run", button_style="success")
+output_area = widgets.Output()
+
+def on_click(b):
+    output_area.clear_output()
+    with output_area:
+        gene = gene_box.value.strip().upper()
+        if gene:
+            run_pipeline(gene)
+        else:
+            print("❗ Please enter a valid gene name.")
+
+run_btn.on_click(on_click)
+display(widgets.HBox([gene_box, run_btn]))
+display(output_area)
